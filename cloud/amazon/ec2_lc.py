@@ -109,7 +109,7 @@ options:
 extends_documentation_fragment:
     - aws
     - ec2
-requires: 
+requires:
     - "boto >= 2.39.0"
 """
 
@@ -142,6 +142,8 @@ try:
     HAS_BOTO = True
 except ImportError:
     HAS_BOTO = False
+
+import copy
 
 
 def create_block_device(module, volume):
@@ -214,13 +216,27 @@ def create_launch_config(connection, module):
 
     launch_configs = connection.get_all_launch_configurations(names=[name])
     changed = False
-    if not launch_configs:
-        try:
-            connection.create_launch_configuration(lc)
-            launch_configs = connection.get_all_launch_configurations(names=[name])
-            changed = True
-        except BotoServerError as e:
-            module.fail_json(msg=str(e))
+
+    if launch_configs:
+        if verify_launch_config(connection, module):
+            module.exit_json(changed=False)
+        else:
+            create_blue_launch_config(connection, module)
+            swap_to_blue_launch_config(connection, module)
+            delete_launch_config(connection, module)
+
+            final_lc_kwargs = create_launch_config(connection, module)
+            swap_to_plain_launch_config(connection, module)
+            delete_blue_launch_config(connection, module)
+            return final_lc_kwargs
+    try:
+        connection.create_launch_configuration(lc)
+        launch_configs = connection.get_all_launch_configurations(names=[name])
+        changed = True
+    except BotoServerError as e:
+        module.fail_json(msg=str(e))
+
+
 
     result = dict(
                  ((a[0], a[1]) for a in vars(launch_configs[0]).items()
@@ -247,21 +263,92 @@ def create_launch_config(connection, module):
                 result['block_device_mappings'][-1]['ebs'] = dict(snapshot_id=bdm.ebs.snapshot_id, volume_size=bdm.ebs.volume_size)
 
 
-    module.exit_json(changed=changed, name=result['name'], created_time=result['created_time'],
-                     image_id=result['image_id'], arn=result['launch_configuration_arn'],
-                     security_groups=result['security_groups'],
-                     instance_type=result['instance_type'],
-                     result=result)
+    return {
+        'changed': changed,
+        'name': result['name'],
+        'created_time': result['created_time'],
+        'image_id': result['image_id'],
+        'arn': result['launch_configuration_arn'],
+        'security_groups': result['security_groups'],
+        'instance_type': result['instance_type'],
+        'result': result
+    }
+
+
+def create_blue_launch_config(connection, module):
+    module_copy = copy.deepcopy(module)
+    module_copy.params['name'] = 'BLUE' + module_copy.params.get('name')
+    create_launch_config(connection, module_copy)
+
+
+def delete_blue_launch_config(connection, module):
+    module_copy = copy.deepcopy(module)
+    module_copy.params['name'] = 'BLUE' + module_copy.params.get('name')
+    delete_launch_config(connection, module_copy)
+
+
+def verify_launch_config(connection, module):
+    """Determine whether or not a pre-existing launch config is exactly as we've specified, or if we need to modify it.
+
+    :param connection: AWS EC2 connection.
+    :param module: Ansible module containing all the parameters about the lc we care about.
+    :return: Boolean of whether or not there exists a launch config with exactly the properties we want.
+    """
+    name = module.params.get('name')
+    image_id = module.params.get('image_id')
+    key_name = module.params.get('key_name')
+    security_groups = module.params['security_groups']
+    user_data = module.params.get('user_data')
+    instance_type = module.params.get('instance_type')
+    assign_public_ip = module.params.get('assign_public_ip')
+    instance_profile_name = module.params.get('instance_profile_name')
+
+    launch_configs = connection.get_all_launch_configurations(names=[name])
+    if not launch_configs:
+        return False
+    else:
+        for launch_config in launch_configs:
+            # the "or None" clause handles the cause of empty user data, where it would be `'' == None` otherwise.
+            b = (launch_config.user_data or None) == user_data
+            b &= launch_config.security_groups == security_groups
+            b &= launch_config.key_name == key_name
+            b &= launch_config.associate_public_ip_address == assign_public_ip
+            b &= launch_config.instance_type == instance_type
+            b &= launch_config.image_id == image_id
+            b &= launch_config.instance_profile_name == instance_profile_name
+            if b:
+                return True
+        return False
+
+
+def swap_to_launch_config(connection, old_name, new_name):
+    all_groups = connection.get_all_groups()
+    all_my_groups = filter(lambda asg: asg.launch_config_name == old_name, all_groups)
+    for asg in all_my_groups:
+        asg.launch_config_name = new_name
+        asg.update()
+
+
+def swap_to_blue_launch_config(connection, module):
+    my_name = module.params.get('name')
+    blue_name = 'BLUE' + module.params.get('name')
+    swap_to_launch_config(connection, my_name, blue_name)
+
+
+def swap_to_plain_launch_config(connection, module):
+    my_name = module.params.get('name')
+    blue_name = 'BLUE' + module.params.get('name')
+    swap_to_launch_config(connection, blue_name, my_name)
 
 
 def delete_launch_config(connection, module):
     name = module.params.get('name')
     launch_configs = connection.get_all_launch_configurations(names=[name])
+    changed = False
     if launch_configs:
         launch_configs[0].delete()
-        module.exit_json(changed=True)
-    else:
-        module.exit_json(changed=False)
+        changed = True
+    return {'changed': changed}
 
 
 def main():
@@ -304,8 +391,9 @@ def main():
     state = module.params.get('state')
 
     if state == 'present':
-        create_launch_config(connection, module)
+        kwargs = create_launch_config(connection, module)
     elif state == 'absent':
-        delete_launch_config(connection, module)
+        kwargs = delete_launch_config(connection, module)
+    module.exit_json(**kwargs)
 
 main()
